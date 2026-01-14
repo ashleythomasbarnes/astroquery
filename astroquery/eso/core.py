@@ -21,6 +21,7 @@ import warnings
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple, Dict, Set, Union
 
+import astropy.units as u
 import astropy.utils.data
 import keyring
 import requests
@@ -35,7 +36,7 @@ from . import conf
 from ..exceptions import RemoteServiceError, LoginError, \
     NoResultsWarning, MaxResultsWarning
 from ..query import QueryWithLogin
-from ..utils import schema
+from ..utils import commons, schema
 from .utils import _UserParams, raise_if_coords_not_valid, _reorder_columns, \
     _raise_if_has_deprecated_keys, _build_adql_string, \
     DEFAULT_LEAD_COLS_PHASE3, DEFAULT_LEAD_COLS_RAW
@@ -589,6 +590,140 @@ class EsoClass(QueryWithLogin):
         t = self._query_on_allowed_values(user_params)
         t = _reorder_columns(t, DEFAULT_LEAD_COLS_RAW)
         return t
+
+    def query_region(
+            self,
+            coordinates, radius=None, *,
+            data: str = "reduced",
+            surveys: Union[List[str], str] = None,
+            instrument: str = None,
+            column_filters: Optional[dict] = None,
+            columns: Union[List, str] = None,
+            maxrec: int = None,
+            **kwargs,
+    ) -> Union[Table, int, str]:
+        """
+        Query a cone region around given coordinates.
+
+        Parameters
+        ----------
+        coordinates : str or `astropy.coordinates.SkyCoord` or coordinate-like
+            Identifier or coordinates around which to query.
+        radius : str or `~astropy.units.Quantity`, optional
+            Cone search radius. If not provided, defaults to 5 arcmin.
+        data : {"reduced", "raw"}, optional
+            Selects which backend query to use. Default is ``"reduced"``.
+        surveys : str or list, optional
+            Name of the survey(s) to query. Only supported when ``data="reduced"``.
+        instrument : str, optional
+            Instrument restriction. Only supported when ``data="raw"``.
+        column_filters : dict or None, optional
+            Constraints applied to the query in ADQL syntax,
+            e.g., ``{"exp_start": "between '2024-12-31' and '2025-12-31'"}``.
+            Default is ``None``.
+        columns : str or list of str, optional
+            Name of the columns the query should return. If specified as a string,
+            it should be a comma-separated list of column names.
+        maxrec : int or None, optional
+            Overrides the configured row limit for this query only.
+        **kwargs
+            Additional optional parameters forwarded to the backend query.
+
+        Returns
+        -------
+        astropy.table.Table, str, int, or None
+            - By default, returns an :class:`~astropy.table.Table` containing records
+              based on the specified columns and constraints. Returns ``None`` if no results.
+            - When ``count_only`` is ``True``, returns an ``int`` representing the
+              record count for the specified filters.
+            - When ``get_query_payload`` is ``True``, returns the query string that
+              would be issued to the TAP service given the specified arguments.
+
+        Examples
+        --------
+        Query reduced data around a target name::
+
+            from astroquery.eso import Eso
+            eso = Eso()
+            table = eso.query_region("M42", radius="5 arcmin")
+
+        Query raw data around a SkyCoord::
+
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            coord = SkyCoord(266.41683, -29.00781, unit="deg", frame="icrs")
+            table = eso.query_region(coord, radius=2 * u.arcmin, data="raw")
+
+        Apply column filters and select columns::
+
+            table = eso.query_region(
+                "NGC 1068",
+                radius="2 arcmin",
+                columns=["dp_id", "s_ra", "s_dec"],
+                column_filters={"dataproduct_type": "image"},
+            )
+        """
+        if data not in ("reduced", "raw"):
+            raise ValueError("data must be either 'reduced' or 'raw'.")
+
+        coords = commons.parse_coordinates(coordinates)
+        c_fk5 = coords.fk5 if hasattr(coords, "fk5") else coords.transform_to("fk5")
+        ra = c_fk5.ra.deg
+        dec = c_fk5.dec.deg
+
+        if radius is None:
+            radius = 5 * u.arcmin
+        else:
+            try:
+                radius = u.Quantity(radius)
+            except Exception as exc:
+                raise TypeError("radius must be a valid angle string or Quantity.") from exc
+
+        if not radius.unit.is_equivalent(u.deg):
+            raise u.UnitsError("radius must be an angular quantity.")
+
+        cone_radius = radius.to_value(u.deg)
+        column_filters = column_filters if column_filters else {}
+
+        row_limit = None
+        if maxrec is not None:
+            row_limit = self.ROW_LIMIT
+            self.ROW_LIMIT = maxrec
+
+        call_kwargs = dict(kwargs)
+        try:
+            if data == "reduced":
+                if instrument is not None:
+                    raise ValueError("instrument is only supported when data='raw'.")
+                return self.query_surveys(
+                    surveys=surveys,
+                    cone_ra=ra,
+                    cone_dec=dec,
+                    cone_radius=cone_radius,
+                    columns=columns,
+                    column_filters=column_filters,
+                    **call_kwargs,
+                )
+
+            if surveys is not None:
+                raise ValueError("surveys is only supported when data='reduced'.")
+            instruments = instrument
+            if "instruments" in call_kwargs:
+                if instruments is not None:
+                    raise ValueError("Specify either instrument or instruments, not both.")
+                instruments = call_kwargs.pop("instruments")
+            return self.query_main(
+                instruments=instruments,
+                cone_ra=ra,
+                cone_dec=dec,
+                cone_radius=cone_radius,
+                columns=columns,
+                column_filters=column_filters,
+                **call_kwargs,
+            )
+        finally:
+            if row_limit is not None:
+                self.ROW_LIMIT = row_limit
 
     @deprecated_renamed_argument(('open_form', 'cache'), (None, None),
                                  since=['0.4.12', '0.4.12'])
